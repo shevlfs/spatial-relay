@@ -17,7 +17,9 @@ concurrency:
 jobs:
   verify:
     name: Build and test
-    runs-on: macos-15
+    # Keep routine checks off the capacity-constrained arm64 runner pool.
+    # Tests run on the host; analysis and Release builds still target arm64.
+    runs-on: macos-15-intel
     timeout-minutes: 20
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
@@ -39,10 +41,10 @@ jobs:
             -project SpatialRelay.xcodeproj \
             -scheme SpatialRelay \
             -configuration Debug \
-            -destination 'platform=macOS,arch=arm64' \
+            -destination 'platform=macOS,arch=x86_64' \
             -derivedDataPath "$RUNNER_TEMP/SpatialRelayDerivedData" \
             -resultBundlePath "$RUNNER_TEMP/SpatialRelayTests.xcresult" \
-            ARCHS=arm64 \
+            ARCHS=x86_64 \
             CODE_SIGNING_ALLOWED=NO \
             test
 
@@ -52,9 +54,10 @@ jobs:
             -project SpatialRelay.xcodeproj \
             -scheme SpatialRelay \
             -configuration Debug \
-            -destination 'platform=macOS,arch=arm64' \
+            -destination 'generic/platform=macOS' \
             -derivedDataPath "$RUNNER_TEMP/SpatialRelayDerivedData" \
             ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO \
             analyze
 
@@ -64,7 +67,7 @@ jobs:
             -project SpatialRelay.xcodeproj \
             -scheme SpatialRelay \
             -configuration Release \
-            -destination 'platform=macOS,arch=arm64' \
+            -destination 'generic/platform=macOS' \
             -derivedDataPath "$RUNNER_TEMP/SpatialRelayDerivedData" \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \

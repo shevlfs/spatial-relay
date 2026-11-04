@@ -69,7 +69,7 @@ xcodebuild \
   test
 ```
 
-CI runs tests, static analysis, and a Release build on a native arm64 macOS runner. Tags matching `vMAJOR.MINOR.PATCH` build an ad-hoc signed app, verify it, and publish a ZIP and SHA-256 checksum to GitHub Releases.
+CI runs the unit tests on an Intel macOS runner, then analyzes and cross-builds the arm64 Release target. Tags matching `vMAJOR.MINOR.PATCH` also run the tests on a native arm64 runner, build an ad-hoc signed app, verify it, and publish a ZIP and SHA-256 checksum to GitHub Releases.
 
 The hosted test suite cannot exercise the System Audio Recording prompt, Spotify playback, AirPods routing, or the Spatial Audio menu. Changes to those paths should also be checked on a physical Mac.
 
