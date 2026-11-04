@@ -27,6 +27,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
     private var lastCapturedFrameCount: UInt64 = 0
     private var stalledCaptureChecks = 0
     private var sampleRateMismatchStartTime: DispatchTime?
+    private var activePipelineID: UUID?
 
     private var isActive = false
 
@@ -72,6 +73,11 @@ final class AudioRelayCoordinator: @unchecked Sendable {
         do {
             tapID = try hardware.createSpotifyTap(processes: processes, outputDevice: output)
             let format = try hardware.tapFormat(tapID)
+            guard format.mSampleRate.isFinite,
+                  format.mSampleRate >= 1,
+                  format.mSampleRate <= Double(Int32.max) else {
+                throw RelayError.unsupportedTapFormat("invalid sample rate \(format.mSampleRate)")
+            }
             guard abs(format.mSampleRate - output.sampleRate) <= 0.5 else {
                 throw RelayError.unsupportedTapFormat(
                     "the tap is \(Int(format.mSampleRate.rounded())) Hz but the output is \(Int(output.sampleRate.rounded())) Hz"
@@ -81,6 +87,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             aggregateID = try hardware.createAggregateDevice(tapUID: uid)
 
             let capture = SRAudioCaptureBridge()
+            let pipelineID = UUID()
             let player = try SampleBufferPlayer(
                 capture: capture,
                 sampleRate: format.mSampleRate,
@@ -88,7 +95,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             ) { [weak self] error in
                 guard let self else { return }
                 self.controlQueue.async { [weak self] in
-                    guard let self, self.isActive else { return }
+                    guard let self, self.isActive, self.activePipelineID == pipelineID else { return }
                     // Flush playback before stopping the tap, then immediately release
                     // mutedWhenTapped so Spotify's direct output is restored.
                     let cleanupFailure = self.stopPipeline()
@@ -114,6 +121,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             lastCapturedFrameCount = capture.capturedFrameCount
             stalledCaptureChecks = 0
             sampleRateMismatchStartTime = nil
+            activePipelineID = pipelineID
             isActive = true
 
             return RelayDiscovery(spotifyProcesses: processes, outputDevice: output)
@@ -135,6 +143,7 @@ final class AudioRelayCoordinator: @unchecked Sendable {
 
     private func stopPipeline() -> Error? {
         isActive = false
+        activePipelineID = nil
         return tearDownPipeline()
     }
 
@@ -143,7 +152,8 @@ final class AudioRelayCoordinator: @unchecked Sendable {
             guard let capture, activeSampleRate > 0 else {
                 return RelayMetrics(peakLevel: 0, bufferedMilliseconds: 0, droppedFrameCount: 0)
             }
-            let buffered = Double(capture.availableFrameCount) / activeSampleRate * 1_000
+            let buffered = player?.bufferedMilliseconds()
+                ?? Double(capture.availableFrameCount) / activeSampleRate * 1_000
             return RelayMetrics(
                 peakLevel: capture.peakLevel,
                 bufferedMilliseconds: buffered,
@@ -172,9 +182,10 @@ final class AudioRelayCoordinator: @unchecked Sendable {
         do {
             let output = try hardware.defaultOutputDevice()
             if output.id != activeOutput.id || output.uid != activeOutput.uid {
-                if !isWithinOutputGrace {
-                    return RelayError.rendererFailed("the default output route changed")
-                }
+                // The renderer is pinned to the original UID. A different
+                // default device needs a fresh tap even during spatial-mode
+                // recovery; continuing could send audio to the old route.
+                return RelayError.rendererFailed("the default output route changed; start the relay again to use \(output.name)")
             }
 
             if abs(output.sampleRate - activeOutput.sampleRate) > 0.5 {

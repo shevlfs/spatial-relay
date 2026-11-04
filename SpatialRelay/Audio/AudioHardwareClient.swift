@@ -44,26 +44,18 @@ final class AudioHardwareClient {
     private let systemObject = AudioObjectID(kAudioObjectSystemObject)
 
     func spotifyProcesses() throws -> [AudioProcessInfo] {
-        var address = propertyAddress(kAudioHardwarePropertyProcessObjectList)
-        var byteCount: UInt32 = 0
-        try CoreAudioFailure.check(
-            AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &byteCount),
-            operation: "Reading the audio process list size"
-        )
-
-        let count = Int(byteCount) / MemoryLayout<AudioObjectID>.stride
-        guard count > 0 else { return [] }
-        var objectIDs = [AudioObjectID](repeating: kAudioObjectUnknown, count: count)
-        let listStatus = objectIDs.withUnsafeMutableBytes { bytes in
-            AudioObjectGetPropertyData(systemObject, &address, 0, nil, &byteCount, bytes.baseAddress!)
-        }
-        try CoreAudioFailure.check(listStatus, operation: "Reading the audio process list")
-
+        let objectIDs = try processObjectIDs()
         return objectIDs.compactMap { objectID in
             guard objectID != kAudioObjectUnknown else { return nil }
 
-            let pid = (try? readPID(objectID)) ?? 0
             let coreAudioBundleID = (try? readString(objectID, selector: kAudioProcessPropertyBundleID)) ?? ""
+            // Most objects belong to other apps. Avoid resolving their process
+            // and AppKit metadata during every relay health check.
+            if !coreAudioBundleID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !SpotifyProcessMatcher.matches(bundleIdentifier: coreAudioBundleID, applicationName: "") {
+                return nil
+            }
+            let pid = (try? readPID(objectID)) ?? 0
             let application = NSRunningApplication(processIdentifier: pid)
             let bundleID = coreAudioBundleID.isEmpty ? (application?.bundleIdentifier ?? "") : coreAudioBundleID
             let applicationName = application?.localizedName ?? ""
@@ -91,6 +83,48 @@ final class AudioHardwareClient {
         }
     }
 
+    private func processObjectIDs() throws -> [AudioObjectID] {
+        var address = propertyAddress(kAudioHardwarePropertyProcessObjectList)
+        let stride = MemoryLayout<AudioObjectID>.stride
+
+        // Processes can start between the size query and read. Retry a growing
+        // list instead of failing a healthy relay when another app opens audio.
+        for attempt in 0..<3 {
+            var byteCount: UInt32 = 0
+            try CoreAudioFailure.check(
+                AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &byteCount),
+                operation: "Reading the audio process list size"
+            )
+            guard byteCount > 0 else { return [] }
+            guard Int(byteCount) % stride == 0 else {
+                throw CoreAudioFailure(
+                    operation: "Reading the audio process list",
+                    status: kAudioHardwareBadPropertySizeError
+                )
+            }
+
+            let allocatedByteCount = byteCount
+            var objectIDs = [AudioObjectID](repeating: kAudioObjectUnknown, count: Int(byteCount) / stride)
+            let status = objectIDs.withUnsafeMutableBytes { bytes in
+                AudioObjectGetPropertyData(systemObject, &address, 0, nil, &byteCount, bytes.baseAddress!)
+            }
+            if status == kAudioHardwareBadPropertySizeError, attempt < 2 { continue }
+            try CoreAudioFailure.check(status, operation: "Reading the audio process list")
+            guard byteCount <= allocatedByteCount, Int(byteCount) % stride == 0 else {
+                throw CoreAudioFailure(
+                    operation: "Reading the audio process list",
+                    status: kAudioHardwareBadPropertySizeError
+                )
+            }
+            // A shrinking list may successfully return fewer objects.
+            return Array(objectIDs.prefix(Int(byteCount) / stride))
+        }
+        throw CoreAudioFailure(
+            operation: "Reading the audio process list",
+            status: kAudioHardwareBadPropertySizeError
+        )
+    }
+
     func defaultOutputDevice() throws -> OutputDeviceInfo {
         var address = propertyAddress(kAudioHardwarePropertyDefaultOutputDevice)
         var deviceID = AudioDeviceID(kAudioObjectUnknown)
@@ -104,26 +138,42 @@ final class AudioHardwareClient {
             throw RelayError.noOutputDevice
         }
 
+        let sampleRate = try readDouble(deviceID, selector: kAudioDevicePropertyNominalSampleRate)
+        guard sampleRate.isFinite, sampleRate >= 1, sampleRate <= Double(Int32.max) else {
+            throw CoreAudioFailure(
+                operation: "Reading the output sample rate",
+                status: kAudioDeviceUnsupportedFormatError
+            )
+        }
+
         return OutputDeviceInfo(
             id: deviceID,
             uid: try readString(deviceID, selector: kAudioDevicePropertyDeviceUID),
             name: try readString(deviceID, selector: kAudioObjectPropertyName),
-            sampleRate: try readDouble(deviceID, selector: kAudioDevicePropertyNominalSampleRate)
+            sampleRate: sampleRate
         )
     }
 
-    func createSpotifyTap(processes: [AudioProcessInfo], outputDevice: OutputDeviceInfo) throws -> AudioObjectID {
-        let description = CATapDescription()
+    static func spotifyTapDescription(
+        processes: [AudioProcessInfo],
+        outputDevice: OutputDeviceInfo
+    ) -> CATapDescription {
+        // Use the selected device stream's format and clock. Enabling mixdown
+        // selects a different capture path even when deviceUID is also set;
+        // that path produced recurring dropouts and warble on Bluetooth output.
+        let description = CATapDescription(
+            processes: processes.map(\.id),
+            deviceUID: outputDevice.uid,
+            stream: 0
+        )
         description.name = "Spatial Relay — Spotify"
-        description.processes = processes.map(\.id)
         description.isPrivate = true
-        description.isExclusive = false
-        description.isMixdown = true
-        description.isMono = false
         description.muteBehavior = .mutedWhenTapped
-        description.deviceUID = outputDevice.uid
-        description.stream = 0
+        return description
+    }
 
+    func createSpotifyTap(processes: [AudioProcessInfo], outputDevice: OutputDeviceInfo) throws -> AudioObjectID {
+        let description = Self.spotifyTapDescription(processes: processes, outputDevice: outputDevice)
         var tapID = AudioObjectID(kAudioObjectUnknown)
         try CoreAudioFailure.check(
             AudioHardwareCreateProcessTap(description, &tapID),
@@ -238,12 +288,18 @@ final class AudioHardwareClient {
 
     private func readString(_ objectID: AudioObjectID, selector: AudioObjectPropertySelector) throws -> String {
         var address = propertyAddress(selector)
-        var value: CFString = "" as CFString
-        var byteCount = UInt32(MemoryLayout<CFString>.size)
+        // These HAL string properties return a retained CFString. Express that
+        // ownership explicitly when writing through the untyped C API.
+        var value: Unmanaged<CFString>?
+        var byteCount = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         let status = withUnsafeMutablePointer(to: &value) { pointer in
             AudioObjectGetPropertyData(objectID, &address, 0, nil, &byteCount, pointer)
         }
+        let string = value?.takeRetainedValue()
         try CoreAudioFailure.check(status, operation: "Reading an audio property")
-        return value as String
+        guard let string else {
+            throw CoreAudioFailure(operation: "Reading an audio property", status: kAudioHardwareUnspecifiedError)
+        }
+        return string as String
     }
 }

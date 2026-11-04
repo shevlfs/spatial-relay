@@ -2,6 +2,17 @@ import AppKit
 import Combine
 import Foundation
 
+protocol AudioRelayControlling: AnyObject, Sendable {
+    func discover() throws -> RelayDiscovery
+    /// Deliver failures after tearing down the failed pipeline and restoring direct output.
+    func start(onFailure: @escaping @Sendable (Error) -> Void) throws -> RelayDiscovery
+    @discardableResult func stop() -> Error?
+    func metrics() -> RelayMetrics
+    func healthFailure() -> Error?
+}
+
+extension AudioRelayCoordinator: AudioRelayControlling {}
+
 @MainActor
 final class RelayViewModel: ObservableObject {
     enum CheckState {
@@ -28,10 +39,13 @@ final class RelayViewModel: ObservableObject {
     @Published private(set) var message: Message?
     @Published private(set) var isRelaying = false
     @Published private(set) var isBusy = false
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var operationLabel = "Starting…"
     @Published private(set) var meterLevel: CGFloat = 0
-    @Published private(set) var latencyLabel = "~80 ms prebuffer"
+    @Published private(set) var bufferedMilliseconds: Double = 0
+    @Published private(set) var droppedFrameCount: UInt64 = 0
 
-    private let coordinator = AudioRelayCoordinator()
+    private let coordinator: any AudioRelayControlling
     private let startupQueue = DispatchQueue(
         label: "com.shevlfs.SpatialRelay.startup",
         qos: .userInitiated
@@ -39,23 +53,41 @@ final class RelayViewModel: ObservableObject {
     private var discovery: RelayDiscovery?
     private var meterTimer: Timer?
     private var healthTick = 0
-    private var startupOperationID: UUID?
+    private var relaySessionID: UUID?
+    private var discoveryOperationID: UUID?
+    private var pollIsRunning = false
     private var terminationCleanupIsRunning = false
     private var terminationCompletions: [() -> Void] = []
     private(set) var isReadyToTerminate = false
 
+    init(coordinator: any AudioRelayControlling = AudioRelayCoordinator()) {
+        self.coordinator = coordinator
+    }
+
     deinit {
         MainActor.assumeIsolated {
             meterTimer?.invalidate()
-            coordinator.stop()
+        }
+        let coordinator = coordinator
+        startupQueue.async {
+            _ = coordinator.stop()
         }
     }
 
     var canToggleRelay: Bool {
         if isRelaying { return !isBusy }
-        return !isBusy &&
+        return !isBusy && !isRefreshing && !terminationCleanupIsRunning && !isReadyToTerminate &&
             discovery?.outputDevice != nil &&
             !(discovery?.spotifyProcesses.isEmpty ?? true)
+    }
+
+    var latencyLabel: String {
+        String(format: "%.0f ms buffered", bufferedMilliseconds)
+    }
+
+    var outputSymbolName: String {
+        discovery?.outputDevice?.isLikelySpatialAudioHeadphones == true
+            ? "headphones" : "speaker.wave.2"
     }
 
     var menuBarSymbolName: String {
@@ -72,28 +104,13 @@ final class RelayViewModel: ObservableObject {
         return "Spatial Relay is stopped"
     }
 
-    func refresh() {
-        // Reopening the menu-bar window calls this view's onAppear again. Do not
-        // make the main actor wait on Core Audio while a permission prompt or
-        // pipeline startup is already running on the coordinator queue.
-        guard !isRelaying, !isBusy else { return }
-
-        do {
-            let discovery = try coordinator.discover()
-            self.discovery = discovery
-            message = nil
-            apply(discovery)
-        } catch {
-            discovery = nil
-            spotifyDetail = "Unable to inspect audio processes"
-            spotifyState = .unavailable
-            outputDetail = "Unable to inspect the current output"
-            outputState = .unavailable
-            message = Message(kind: .error, text: error.localizedDescription)
-        }
+    func refresh(preservingError: Bool = false) {
+        guard !isRelaying, !isBusy, !isRefreshing, !isReadyToTerminate else { return }
+        refreshRoute(preservingError: preservingError)
     }
 
     func toggleRelay() {
+        guard canToggleRelay else { return }
         if isRelaying {
             stopRelay()
         } else {
@@ -102,19 +119,24 @@ final class RelayViewModel: ObservableObject {
     }
 
     func openSpotify() {
+        guard !isBusy, !isRelaying, !isReadyToTerminate else { return }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.spotify.client") else {
             message = Message(kind: .error, text: "Spotify is not installed in a location macOS can find.")
             return
         }
 
         NSWorkspace.shared.openApplication(at: url, configuration: .init()) { [weak self] _, error in
-            guard let viewModel = self else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak viewModel] in
+            DispatchQueue.main.async { [weak self] in
                 MainActor.assumeIsolated {
+                    guard let self, !self.isRelaying, !self.isBusy, !self.isReadyToTerminate else { return }
                     if let error {
-                        viewModel?.message = Message(kind: .error, text: error.localizedDescription)
+                        self.message = Message(kind: .error, text: error.localizedDescription)
                     } else {
-                        viewModel?.refresh()
+                        self.refresh()
+                        // Spotify may register its audio process after launch completes.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                            self?.refresh(preservingError: true)
+                        }
                     }
                 }
             }
@@ -131,11 +153,14 @@ final class RelayViewModel: ObservableObject {
         guard !terminationCleanupIsRunning else { return }
         terminationCleanupIsRunning = true
 
-        startupOperationID = nil
+        relaySessionID = nil
+        discoveryOperationID = nil
+        isRefreshing = false
         meterTimer?.invalidate()
         meterTimer = nil
         isRelaying = false
         isBusy = true
+        operationLabel = "Quitting…"
         meterLevel = 0
 
         // The serial startup queue gives cleanup strict ordering after a tap
@@ -165,9 +190,10 @@ final class RelayViewModel: ObservableObject {
 
     private func startRelay() {
         isBusy = true
+        operationLabel = "Starting…"
         message = nil
         let operationID = UUID()
-        startupOperationID = operationID
+        relaySessionID = operationID
         let coordinator = coordinator
 
         // Tap creation can wait for Core Audio or a privacy prompt. Keep it off
@@ -177,12 +203,12 @@ final class RelayViewModel: ObservableObject {
             do {
                 let discovery = try coordinator.start { [weak self] error in
                     Task { @MainActor in
-                        self?.handlePipelineFailure(error)
+                        self?.handlePipelineFailure(error, sessionID: operationID)
                     }
                 }
                 result = .success(discovery)
             } catch {
-                result = .failure(error)
+                result = .failure(coordinator.stop() ?? error)
             }
 
             DispatchQueue.main.async { [weak self] in
@@ -197,8 +223,7 @@ final class RelayViewModel: ObservableObject {
         _ result: Result<RelayDiscovery, Error>,
         operationID: UUID
     ) {
-        guard startupOperationID == operationID else { return }
-        startupOperationID = nil
+        guard relaySessionID == operationID else { return }
         isBusy = false
 
         switch result {
@@ -209,72 +234,100 @@ final class RelayViewModel: ObservableObject {
             if let output = discovery.outputDevice, !output.isLikelySpatialAudioHeadphones {
                 message = Message(
                     kind: .warning,
-                    text: "Relay active, but \(output.name) does not look like Spatial Audio-capable AirPods. Choose your AirPods as the Mac's output, then restart the relay."
+                    text: "Relaying to \(output.name). For Spatial Audio, select your AirPods in macOS, then restart the relay."
                 )
             } else {
-                message = Message(
-                    kind: .info,
-                    text: "Relay active. Spatial Audio is now controlled for Spatial Relay in the macOS Sound menu."
-                )
+                message = nil
             }
             startMetering()
         case .failure(let error):
-            let cleanupFailure = coordinator.stop()
+            relaySessionID = nil
             isRelaying = false
             message = Message(
                 kind: .error,
-                text: startFailureMessage(cleanupFailure ?? error)
+                text: startFailureMessage(error)
             )
         }
     }
 
     private func stopRelay() {
-        startupOperationID = nil
+        relaySessionID = nil
         isBusy = true
+        operationLabel = "Stopping…"
         meterTimer?.invalidate()
         meterTimer = nil
-        let cleanupFailure = coordinator.stop()
-        isRelaying = false
-        meterLevel = 0
-        isBusy = false
-        message = cleanupFailure.map {
-            Message(kind: .error, text: $0.localizedDescription)
-        } ?? Message(kind: .info, text: "Relay stopped. Spotify is playing directly again.")
-        refreshRouteRowsPreservingMessage()
+        let coordinator = coordinator
+        startupQueue.async { [weak self] in
+            let cleanupFailure = coordinator.stop()
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, !self.terminationCleanupIsRunning, !self.isReadyToTerminate else { return }
+                    self.isRelaying = false
+                    self.meterLevel = 0
+                    self.bufferedMilliseconds = 0
+                    self.droppedFrameCount = 0
+                    self.isBusy = false
+                    self.message = cleanupFailure.map {
+                        Message(kind: .error, text: $0.localizedDescription)
+                    }
+                    self.refreshRoute(preservingError: true)
+                }
+            }
+        }
     }
 
-    private func handlePipelineFailure(_ error: Error) {
-        startupOperationID = nil
+    private func handlePipelineFailure(_ error: Error, sessionID: UUID) {
+        guard relaySessionID == sessionID, !terminationCleanupIsRunning else { return }
+        relaySessionID = nil
         meterTimer?.invalidate()
         meterTimer = nil
         isRelaying = false
         isBusy = false
         meterLevel = 0
+        bufferedMilliseconds = 0
+        droppedFrameCount = 0
         message = Message(kind: .error, text: error.localizedDescription)
-        refreshRouteRowsPreservingMessage()
+        refreshRoute(preservingError: true)
     }
 
     private func startMetering() {
         meterTimer?.invalidate()
         healthTick = 0
-        meterTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.isRelaying else { return }
+                self?.pollPipeline()
+            }
+        }
+        timer.tolerance = 0.02
+        RunLoop.main.add(timer, forMode: .common)
+        meterTimer = timer
+    }
 
-                let metrics = self.coordinator.metrics()
-                let shapedPeak = CGFloat(pow(max(0, min(1, metrics.peakLevel)), 0.45))
-                self.meterLevel = max(shapedPeak, self.meterLevel * 0.72)
-                self.latencyLabel = metrics.droppedFrameCount == 0
-                    ? "~80 ms prebuffer"
-                    : "\(metrics.droppedFrameCount) frames dropped"
-
-                self.healthTick += 1
-                if self.healthTick >= 8 {
-                    self.healthTick = 0
-                    if let failure = self.coordinator.healthFailure() {
-                        let cleanupFailure = self.coordinator.stop()
-                        self.handlePipelineFailure(cleanupFailure ?? failure)
+    private func pollPipeline() {
+        guard isRelaying, !isBusy, !pollIsRunning, let sessionID = relaySessionID else { return }
+        pollIsRunning = true
+        healthTick += 1
+        let shouldCheckHealth = healthTick >= 8
+        if shouldCheckHealth { healthTick = 0 }
+        let coordinator = coordinator
+        startupQueue.async { [weak self] in
+            let metrics = coordinator.metrics()
+            let failure = shouldCheckHealth ? coordinator.healthFailure() : nil
+            let reportedFailure = failure.map { coordinator.stop() ?? $0 }
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.pollIsRunning = false
+                    guard self.relaySessionID == sessionID, !self.isBusy else { return }
+                    if let reportedFailure {
+                        self.handlePipelineFailure(reportedFailure, sessionID: sessionID)
+                        return
                     }
+                    let peak = metrics.peakLevel.isFinite ? max(0, min(1, metrics.peakLevel)) : 0
+                    self.meterLevel = max(CGFloat(pow(peak, 0.45)), self.meterLevel * 0.72)
+                    self.bufferedMilliseconds = metrics.bufferedMilliseconds.isFinite
+                        ? max(0, metrics.bufferedMilliseconds) : 0
+                    self.droppedFrameCount = metrics.droppedFrameCount
                 }
             }
         }
@@ -288,12 +341,12 @@ final class RelayViewModel: ObservableObject {
             let activeCount = discovery.spotifyProcesses.filter(\.isRunningOutput).count
             spotifyDetail = activeCount > 0
                 ? "Audio stream detected"
-                : "Connected; waiting for playback"
+                : "Waiting for playback"
             spotifyState = activeCount > 0 ? .ready : .warning
         }
 
         if let output = discovery.outputDevice {
-            outputDetail = "\(output.name) · \(Int(output.sampleRate.rounded())) Hz"
+            outputDetail = output.name
             outputState = output.isLikelySpatialAudioHeadphones ? .ready : .warning
         } else {
             outputDetail = "No default output device"
@@ -306,29 +359,47 @@ final class RelayViewModel: ObservableObject {
         message = Message(kind: .error, text: RelayError.unsupportedMac.localizedDescription)
         #else
         if discovery.spotifyProcesses.isEmpty {
-            message = Message(kind: .warning, text: "Spotify only appears in Core Audio after it opens an audio stream. Start a song, then click Refresh.")
+            message = Message(kind: .warning, text: "Play a song in Spotify, then refresh to connect.")
+        } else if discovery.outputDevice == nil {
+            message = Message(kind: .warning, text: "Select an audio output in the macOS Sound menu.")
         } else if let output = discovery.outputDevice, !output.isLikelySpatialAudioHeadphones {
-            message = Message(kind: .warning, text: "The current output does not look like Spatial Audio-capable AirPods. Connect AirPods before starting the relay.")
+            message = Message(kind: .warning, text: "Select your AirPods in the macOS Sound menu to use Spatial Audio.")
         } else if !isRelaying {
             message = nil
         }
         #endif
     }
 
-    private func refreshRouteRowsPreservingMessage() {
-        let savedMessage = message
-        do {
-            let discovery = try coordinator.discover()
-            self.discovery = discovery
-            apply(discovery)
-        } catch {
-            discovery = nil
-            spotifyDetail = "Unable to inspect audio processes"
-            spotifyState = .unavailable
-            outputDetail = "Unable to inspect the current output"
-            outputState = .unavailable
+    private func refreshRoute(preservingError: Bool) {
+        let operationID = UUID()
+        discoveryOperationID = operationID
+        isRefreshing = true
+        let coordinator = coordinator
+        startupQueue.async { [weak self] in
+            let result = Result { try coordinator.discover() }
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, self.discoveryOperationID == operationID else { return }
+                    self.discoveryOperationID = nil
+                    self.isRefreshing = false
+                    let savedError = preservingError && self.message?.kind == .error ? self.message : nil
+                    switch result {
+                    case .success(let discovery):
+                        self.discovery = discovery
+                        self.message = savedError
+                        self.apply(discovery)
+                    case .failure(let error):
+                        self.discovery = nil
+                        self.spotifyDetail = "Could not check Spotify"
+                        self.spotifyState = .unavailable
+                        self.outputDetail = "Could not check output"
+                        self.outputState = .unavailable
+                        self.message = Message(kind: .error, text: error.localizedDescription)
+                    }
+                    if let savedError { self.message = savedError }
+                }
+            }
         }
-        message = savedMessage
     }
 
     private func startFailureMessage(_ error: Error) -> String {

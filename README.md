@@ -41,15 +41,19 @@ To build locally:
 5. Approve **System Audio Recording** access when macOS asks.
 6. Open the macOS Sound or AirPods menu and select **Fixed** or **Head Tracked** under Spatial Audio.
 
-Stop the relay before intentionally changing output devices. Use **Quit Spatial Relay** from the ellipsis menu to close the app and restore Spotify's direct output.
+Stop the relay before intentionally changing output devices. If the output device changes during playback, the relay stops and restores Spotify's direct output. Start it again to use the new device. Use **Quit Spatial Relay** from the ellipsis menu to close the app.
 
 ## Audio and privacy
 
 The relay accepts stereo, native-endian 32-bit floating-point PCM from Core Audio and submits Float32 PCM at the output device's nominal sample rate. It does not add lossy encoding, sample-rate conversion, normalization, EQ, or gain changes. Spotify's own source quality and normalization settings still apply.
 
+Capture uses a device-stream process tap for the selected output. This keeps the tap tied to the output stream's format and clock; using a mixdown tap caused recurring glitches on Bluetooth headphones even when both reported the same nominal sample rate.
+
 Audio remains in a bounded in-memory buffer. It is not written to disk, sent over the network, or collected as telemetry. Spotify's original output is muted only while the process tap is active. Normal stop, quit, and failure paths restore direct output.
 
-Spatial Audio mode changes can briefly reconfigure the renderer. Spatial Relay gives those changes a five-second recovery window, flushes and rebases the render timeline, and stops safely if the output does not recover.
+The playback buffer targets 40 ms of audio, with a 4 ms pump interval. The panel shows audio queued in the capture buffer and renderer; it does not measure Bluetooth or device latency. A short audio burst that cannot fill the target buffer starts after an 80 ms wait.
+
+Spatial Audio mode changes can briefly reconfigure the renderer. Spatial Relay gives those changes a five-second recovery window, flushes and rebases the render timeline, and keeps only recent captured audio when resuming. Recovery may cause a brief gap, but avoids carrying a long delay into playback. The relay stops safely if the output does not recover.
 
 ## Development
 

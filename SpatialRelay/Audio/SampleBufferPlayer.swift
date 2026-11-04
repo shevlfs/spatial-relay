@@ -15,7 +15,59 @@ enum OutputReconfigurationGrace {
     }
 }
 
+enum PlaybackBufferingPolicy {
+    static func prebufferFrameCount(sampleRate: Double) -> Int64 {
+        max(1_024, Int64((sampleRate * 0.04).rounded(.up)))
+    }
+
+    static func recoveryDiscardFrameCount(availableFrames: UInt32, sampleRate: Double) -> UInt32 {
+        let retainedFrames = UInt32(prebufferFrameCount(sampleRate: sampleRate))
+        return availableFrames > retainedFrames ? availableFrames - retainedFrames : 0
+    }
+
+    static func shouldStartPlayback(
+        enqueuedFrames: Int64,
+        targetFrames: Int64,
+        elapsedMilliseconds: UInt64
+    ) -> Bool {
+        enqueuedFrames > 0 && (enqueuedFrames >= targetFrames || elapsedMilliseconds >= 80)
+    }
+}
+
 enum RendererRecoveryTimeline {
+    static func hasPlaybackProgress(
+        currentTime: CMTime,
+        rate: Double,
+        segmentStartFrame: Int64,
+        timescale: CMTimeScale
+    ) -> Bool {
+        guard timescale > 0, currentTime.isNumeric, abs(rate - 1) < 0.000_1 else { return false }
+        return CMTimeCompare(currentTime, CMTime(value: segmentStartFrame, timescale: timescale)) > 0
+    }
+
+    static func isPaused(
+        currentTime: CMTime,
+        rate: Double,
+        targetFrame: Int64,
+        timescale: CMTimeScale
+    ) -> Bool {
+        guard timescale > 0, currentTime.isNumeric, abs(rate) < 0.000_1 else { return false }
+        return CMTimeCompare(currentTime, CMTime(value: targetFrame, timescale: timescale)) == 0
+    }
+
+    static func bufferedFrameCount(
+        currentTime: CMTime,
+        segmentStartFrame: Int64,
+        nextFrame: Int64,
+        timescale: CMTimeScale
+    ) -> Int64 {
+        guard nextFrame > segmentStartFrame else { return 0 }
+        guard timescale > 0, currentTime.isNumeric else { return nextFrame - segmentStartFrame }
+        let playhead = CMTimeConvertScale(currentTime, timescale: timescale, method: .roundTowardZero)
+        guard playhead.isNumeric else { return nextFrame - segmentStartFrame }
+        return nextFrame - min(nextFrame, max(segmentStartFrame, playhead.value))
+    }
+
     static func restartFrame(
         currentTime: CMTime,
         suggestedFlushTime: CMTime?,
@@ -47,7 +99,10 @@ final class SampleBufferPlayer: @unchecked Sendable {
     private let capture: SRAudioCaptureBridge
     private let renderer = AVSampleBufferAudioRenderer()
     private let synchronizer = AVSampleBufferRenderSynchronizer()
-    private let serializationQueue = DispatchQueue(label: "com.shevlfs.SpatialRelay.sample-buffer-player")
+    private let serializationQueue = DispatchQueue(
+        label: "com.shevlfs.SpatialRelay.sample-buffer-player",
+        qos: .userInitiated
+    )
     private let queueKey = DispatchSpecificKey<UInt8>()
     private let factory: PCMSampleBufferFactory
     private let sampleRate: Double
@@ -63,6 +118,8 @@ final class SampleBufferPlayer: @unchecked Sendable {
     private var timelineIsRunning = false
     private var backpressureStartTime: DispatchTime?
     private var pauseTransitionStartTime: DispatchTime?
+    private var pauseTransitionTargetFrame: Int64 = 0
+    private var segmentFirstEnqueueTime: DispatchTime?
     private var lastRendererConfigurationChangeTime: DispatchTime?
     private var rendererRecoveryIsActive = false
     private var formatRecoveryStartTime: DispatchTime?
@@ -86,8 +143,11 @@ final class SampleBufferPlayer: @unchecked Sendable {
         self.timeScale = CMTimeScale(roundedRate)
         self.onFailure = onFailure
         self.factory = try PCMSampleBufferFactory(sampleRate: sampleRate)
-        self.prebufferFrameCount = max(2_048, Int64(sampleRate * 0.08))
+        self.prebufferFrameCount = PlaybackBufferingPolicy.prebufferFrameCount(sampleRate: sampleRate)
         renderer.audioOutputDeviceUniqueID = outputDeviceUID
+        // Playback always runs at 1x. No pitch correction is needed for this
+        // live PCM stream, so avoid the default speech time-stretch algorithm.
+        renderer.audioTimePitchAlgorithm = .varispeed
         serializationQueue.setSpecific(key: queueKey, value: 1)
     }
 
@@ -106,6 +166,8 @@ final class SampleBufferPlayer: @unchecked Sendable {
             timelineIsRunning = false
             backpressureStartTime = nil
             pauseTransitionStartTime = nil
+            pauseTransitionTargetFrame = 0
+            segmentFirstEnqueueTime = nil
             lastRendererConfigurationChangeTime = nil
             rendererRecoveryIsActive = false
             formatRecoveryStartTime = nil
@@ -119,11 +181,12 @@ final class SampleBufferPlayer: @unchecked Sendable {
             synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
             synchronizer.addRenderer(renderer)
             synchronizer.setRate(0, time: .zero)
+            pauseTransitionStartTime = .now()
 
             installRendererObservers()
 
             let timer = DispatchSource.makeTimerSource(queue: serializationQueue)
-            timer.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .milliseconds(2))
+            timer.schedule(deadline: .now(), repeating: .milliseconds(4), leeway: .milliseconds(1))
             timer.setEventHandler { [weak self] in
                 self?.pump()
             }
@@ -152,6 +215,8 @@ final class SampleBufferPlayer: @unchecked Sendable {
             enqueuedFrameCount = 0
             backpressureStartTime = nil
             pauseTransitionStartTime = nil
+            pauseTransitionTargetFrame = 0
+            segmentFirstEnqueueTime = nil
             lastRendererConfigurationChangeTime = nil
             rendererRecoveryIsActive = false
             formatRecoveryStartTime = nil
@@ -173,6 +238,23 @@ final class SampleBufferPlayer: @unchecked Sendable {
         }
     }
 
+    /// Software queue occupancy only; Bluetooth and device latency are not
+    /// observable here and must not be presented as an end-to-end measurement.
+    func bufferedMilliseconds() -> Double {
+        performSync {
+            guard isStarted else { return 0 }
+            let rendererFrames = timelineIsRunning
+                ? RendererRecoveryTimeline.bufferedFrameCount(
+                    currentTime: synchronizer.currentTime(),
+                    segmentStartFrame: segmentStartFrame,
+                    nextFrame: nextFrame,
+                    timescale: timeScale
+                )
+                : enqueuedFrameCount
+            return (Double(capture.availableFrameCount) + Double(rendererFrames)) / sampleRate * 1_000
+        }
+    }
+
     private func pump() {
         guard isStarted && !failureWasDelivered else { return }
 
@@ -189,6 +271,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
         if mismatchCount > observedFormatMismatchCount {
             observedFormatMismatchCount = mismatchCount
             if formatRecoveryStartTime == nil {
+                recoverRendererAfterConfigurationChange()
                 formatRecoveryStartTime = .now()
                 capturedFramesAtFormatMismatch = capture.capturedFrameCount
             }
@@ -209,11 +292,50 @@ final class SampleBufferPlayer: @unchecked Sendable {
             return
         }
 
-        // setRate(_:time:) completes asynchronously. Keep new PCM in the ring
-        // until the synchronizer confirms it is paused, rather than relying on
-        // a fixed delay under load.
+        if rendererRecoveryIsActive, timelineIsRunning {
+            var currentTime = CMTime.invalid
+            var currentRate = Double.nan
+            CMTimebaseGetTimeAndRate(synchronizer.timebase, timeOut: &currentTime, rateOut: &currentRate)
+            if RendererRecoveryTimeline.hasPlaybackProgress(
+                currentTime: currentTime,
+                rate: currentRate,
+                segmentStartFrame: segmentStartFrame,
+                timescale: timeScale
+            ) {
+                rendererRecoveryIsActive = false
+            }
+        }
+
+        let isWithinRecoveryWindow = lastRendererConfigurationChangeTime.map {
+            OutputReconfigurationGrace.contains(
+                startUptimeNanoseconds: $0.uptimeNanoseconds,
+                nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+            )
+        } ?? false
+        if rendererRecoveryIsActive, !isWithinRecoveryWindow {
+            if !timelineIsRunning, enqueuedFrameCount == 0,
+               capture.availableFrameCount == 0, pauseTransitionStartTime == nil {
+                // An idle, successfully paused renderer needs no PCM to recover.
+                rendererRecoveryIsActive = false
+            } else {
+                deliverFailure(RelayError.rendererFailed("the output did not recover after its configuration changed"))
+                return
+            }
+        }
+
+        // The public rate property changes synchronously, before the timebase
+        // applies setRate(_:time:). Check both the actual rate and anchor time
+        // before enqueueing PCM against the restarted timeline.
         if let pauseTransitionStartTime {
-            if abs(synchronizer.rate) < 0.000_1 {
+            var currentTime = CMTime.invalid
+            var currentRate = Double.nan
+            CMTimebaseGetTimeAndRate(synchronizer.timebase, timeOut: &currentTime, rateOut: &currentRate)
+            if RendererRecoveryTimeline.isPaused(
+                currentTime: currentTime,
+                rate: currentRate,
+                targetFrame: pauseTransitionTargetFrame,
+                timescale: timeScale
+            ) {
                 self.pauseTransitionStartTime = nil
             } else if elapsedMilliseconds(since: pauseTransitionStartTime) > OutputReconfigurationGrace.durationMilliseconds {
                 deliverFailure(RelayError.rendererFailed("the render timeline did not pause"))
@@ -223,10 +345,22 @@ final class SampleBufferPlayer: @unchecked Sendable {
             }
         }
 
-        if rendererRecoveryIsActive,
-           timelineIsRunning,
-           abs(synchronizer.rate - 1) < 0.000_1 {
-            rendererRecoveryIsActive = false
+        // Renderer queue depth includes the device's required playback lead.
+        // Flushing it at a fixed software-buffer threshold can repeatedly
+        // interrupt AirPods startup before the audio clock starts advancing.
+        // Recovery is confirmed by actual progress above, while the separate
+        // pause, backpressure, and format checks handle a stalled pipeline.
+        // A route reconfiguration can hold up playback for seconds. Keep the
+        // most recent PCM when restarting a live relay instead of preserving
+        // that entire delay for the rest of the listening session.
+        if rendererRecoveryIsActive, !timelineIsRunning {
+            let staleFrames = PlaybackBufferingPolicy.recoveryDiscardFrameCount(
+                availableFrames: capture.availableFrameCount,
+                sampleRate: sampleRate
+            )
+            if staleFrames > 0 {
+                _ = capture.discardFrames(maximumFrameCount: staleFrames)
+            }
         }
 
         // If the control queue was delayed while Spotify was silent, the
@@ -248,6 +382,7 @@ final class SampleBufferPlayer: @unchecked Sendable {
             do {
                 if enqueuedFrameCount == 0 {
                     segmentStartFrame = nextFrame
+                    segmentFirstEnqueueTime = .now()
                 }
                 let sampleBuffer = try factory.makeSampleBuffer(
                     data: chunk.data,
@@ -280,10 +415,17 @@ final class SampleBufferPlayer: @unchecked Sendable {
             backpressureStartTime = nil
         }
 
-        if !timelineIsRunning,
-           enqueuedFrameCount >= prebufferFrameCount {
-            synchronizer.setRate(1, time: mediaTime(forFrame: segmentStartFrame))
-            timelineIsRunning = true
+        // A short burst followed by a pause may never fill the target buffer.
+        // Play its tail after a bounded wait rather than leaving it queued forever.
+        if !timelineIsRunning, let segmentFirstEnqueueTime {
+            if PlaybackBufferingPolicy.shouldStartPlayback(
+                enqueuedFrames: enqueuedFrameCount,
+                targetFrames: prebufferFrameCount,
+                elapsedMilliseconds: elapsedMilliseconds(since: segmentFirstEnqueueTime)
+            ) {
+                synchronizer.setRate(1, time: mediaTime(forFrame: segmentStartFrame))
+                timelineIsRunning = true
+            }
         }
 
         // The ring is normally empty while the renderer stays prebuffered. When
@@ -312,9 +454,11 @@ final class SampleBufferPlayer: @unchecked Sendable {
         nextFrame = restartFrame
         segmentStartFrame = restartFrame
         enqueuedFrameCount = 0
+        segmentFirstEnqueueTime = nil
         timelineIsRunning = false
         backpressureStartTime = nil
         pauseTransitionStartTime = .now()
+        pauseTransitionTargetFrame = restartFrame
     }
 
     /// Spatial Audio mode changes legitimately reconfigure the AirPods output.
@@ -323,7 +467,9 @@ final class SampleBufferPlayer: @unchecked Sendable {
     /// stop the relay. Keep captured PCM in the ring, rebase, and prebuffer it.
     private func recoverRendererAfterConfigurationChange(suggestedFlushTime: CMTime? = nil) {
         guard isStarted && !failureWasDelivered else { return }
-        lastRendererConfigurationChangeTime = .now()
+        if !rendererRecoveryIsActive {
+            lastRendererConfigurationChangeTime = .now()
+        }
 
         // OutputConfigurationDidChange and WasFlushedAutomatically commonly
         // arrive as a pair. If the first notification is still waiting for the
@@ -345,9 +491,11 @@ final class SampleBufferPlayer: @unchecked Sendable {
         nextFrame = restartFrame
         segmentStartFrame = restartFrame
         enqueuedFrameCount = 0
+        segmentFirstEnqueueTime = nil
         timelineIsRunning = false
         backpressureStartTime = nil
         pauseTransitionStartTime = .now()
+        pauseTransitionTargetFrame = restartFrame
     }
 
     private func installRendererObservers() {
@@ -387,9 +535,9 @@ final class SampleBufferPlayer: @unchecked Sendable {
     private func deliverFailure(_ error: Error) {
         guard !failureWasDelivered else { return }
         failureWasDelivered = true
-        // Do not wait for the main actor to tear down the UI. Stopping the IOProc
-        // here immediately releases mutedWhenTapped during renderer failures.
-        try? capture.stop()
+        // Failures go directly to the coordinator queue, which owns capture
+        // start/stop. Calling capture.stop() here raced its health checks and
+        // teardown. The coordinator restores direct output without a UI round trip.
         onFailure(error)
     }
 

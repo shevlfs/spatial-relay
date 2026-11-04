@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -32,6 +33,7 @@ struct CaptureStorage {
     std::atomic<UInt64> callbacks { 0 };
     std::atomic<UInt64> capturedFrames { 0 };
     std::atomic<UInt32> peakBits { 0 };
+    std::atomic<bool> callbackIsRegistered { false };
 
     bool nonInterleaved = false;
     UInt32 bytesPerFrame = 0;
@@ -43,7 +45,7 @@ struct CaptureStorage {
         formatMismatches.store(0, std::memory_order_relaxed);
         callbacks.store(0, std::memory_order_relaxed);
         capturedFrames.store(0, std::memory_order_relaxed);
-        storePeak(0.0f);
+        peakBits.store(0, std::memory_order_relaxed);
     }
 
     UInt32 available() const noexcept {
@@ -56,11 +58,16 @@ struct CaptureStorage {
         return static_cast<UInt32>(std::min<UInt64>(write - read, capacityFrames));
     }
 
-    void storePeak(float peak) noexcept {
+    void publishPeak(float peak) noexcept {
         UInt32 bits = 0;
         static_assert(sizeof(bits) == sizeof(peak));
         std::memcpy(&bits, &peak, sizeof(bits));
-        peakBits.store(bits, std::memory_order_relaxed);
+        // Nonnegative finite IEEE Float32 values have the same bit ordering as
+        // UInt32. Hold the maximum until the UI consumes it, rather than losing
+        // transients to a quieter callback between meter polls.
+        UInt32 previous = peakBits.load(std::memory_order_relaxed);
+        while (previous < bits &&
+               !peakBits.compare_exchange_weak(previous, bits, std::memory_order_relaxed)) {}
     }
 
     float takePeak() noexcept {
@@ -105,7 +112,7 @@ struct CaptureStorage {
         for (UInt32 index = 0; index < frames * 2; ++index) {
             peak = std::max(peak, std::fabs(source[index]));
         }
-        storePeak(std::min(peak, 1.0f));
+        publishPeak(std::min(peak, 1.0f));
         capturedFrames.fetch_add(frames, std::memory_order_relaxed);
         writeCursor.store(write + frames, std::memory_order_release);
     }
@@ -126,7 +133,7 @@ struct CaptureStorage {
             peak = std::max(peak, std::max(std::fabs(left[index]), std::fabs(right[index])));
         }
 
-        storePeak(std::min(peak, 1.0f));
+        publishPeak(std::min(peak, 1.0f));
         capturedFrames.fetch_add(frames, std::memory_order_relaxed);
         writeCursor.store(write + frames, std::memory_order_release);
     }
@@ -152,6 +159,16 @@ struct CaptureStorage {
                         static_cast<size_t>(frames - first) * 2 * sizeof(float));
         }
 
+        readCursor.store(read + frames, std::memory_order_release);
+        return frames;
+    }
+
+    UInt32 discard(UInt32 maximumFrames) noexcept {
+        const UInt64 read = readCursor.load(std::memory_order_relaxed);
+        const UInt64 write = writeCursor.load(std::memory_order_acquire);
+        const UInt32 frames = static_cast<UInt32>(
+            std::min<UInt64>(maximumFrames, write - read)
+        );
         readCursor.store(read + frames, std::memory_order_release);
         return frames;
     }
@@ -281,7 +298,8 @@ NSError *captureError(NSString *operation, OSStatus status) {
 }
 
 - (BOOL)isCapturing {
-    return _ioProcID != nullptr;
+    auto *state = storage(self);
+    return state != nullptr && state->callbackIsRegistered.load(std::memory_order_acquire);
 }
 
 - (UInt32)availableFrameCount {
@@ -384,6 +402,7 @@ NSError *captureError(NSString *operation, OSStatus status) {
 
     _deviceID = deviceID;
     _ioProcID = ioProcID;
+    state->callbackIsRegistered.store(true, std::memory_order_release);
     // Set this before AudioDeviceStart. If start reports an error after doing
     // partial work, cleanup will still make a conservative stop attempt.
     _ioProcMayBeRunning = YES;
@@ -444,6 +463,7 @@ NSError *captureError(NSString *operation, OSStatus status) {
         _ioProcID = nullptr;
         _deviceID = kAudioObjectUnknown;
         _ioProcMayBeRunning = NO;
+        storage(self)->callbackIsRegistered.store(false, std::memory_order_release);
         return YES;
     }
 
@@ -480,13 +500,23 @@ NSError *captureError(NSString *operation, OSStatus status) {
     const UInt32 requested = std::min(maximumFrameCount, available);
     if (requested == 0) return nil;
 
-    NSMutableData *data = [NSMutableData dataWithLength:static_cast<NSUInteger>(requested) * 2 * sizeof(float)];
-    const UInt32 actual = state->readInterleaved(static_cast<float *>(data.mutableBytes), requested);
+    const size_t byteCount = static_cast<size_t>(requested) * 2 * sizeof(float);
+    std::unique_ptr<float, decltype(&std::free)> samples(
+        static_cast<float *>(std::malloc(byteCount)), &std::free
+    );
+    if (!samples) return nil;
+    const UInt32 actual = state->readInterleaved(samples.get(), requested);
     if (actual == 0) return nil;
-    if (actual < requested) {
-        data.length = static_cast<NSUInteger>(actual) * 2 * sizeof(float);
-    }
+    // Immutable backing can bridge to Swift Data without copying mutable bytes.
+    NSData *data = [[NSData alloc] initWithBytesNoCopy:samples.release()
+                                              length:static_cast<NSUInteger>(actual) * 2 * sizeof(float)
+                                        freeWhenDone:YES];
     return [[SRPCMChunk alloc] initWithData:data frameCount:actual];
+}
+
+- (UInt32)discardFramesWithMaximumFrameCount:(UInt32)maximumFrameCount {
+    auto *state = storage(self);
+    return state == nullptr ? 0 : state->discard(maximumFrameCount);
 }
 
 #if DEBUG
