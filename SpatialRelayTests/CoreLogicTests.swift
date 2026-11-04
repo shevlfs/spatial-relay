@@ -577,7 +577,15 @@ final class RelayViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.message, failureMessage)
         viewModel.refresh()
         try await waitUntil { !viewModel.isRefreshing }
+        #if arch(arm64)
         XCTAssertNil(viewModel.message)
+        #else
+        XCTAssertEqual(
+            viewModel.message,
+            RelayViewModel.Message(kind: .error, text: RelayError.unsupportedMac.localizedDescription),
+            "Refreshing clears the pipeline error but preserves the Intel compatibility warning"
+        )
+        #endif
     }
 
     @MainActor
